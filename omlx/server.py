@@ -2425,11 +2425,15 @@ _KEEPALIVE_COMPLETION_CHUNK = (
 )
 
 
-def _completion_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id."""
+def _completion_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive frame that shares the stream's id, model and creation time.
+
+    See ``_chat_keepalive_chunk`` for why each identity field must match.
+    """
     return (
-        'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
-        '"model":"keepalive",'
+        'data: {"id":"' + response_id + '","object":"text_completion",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
@@ -2462,8 +2466,8 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     return None
 
 
-def _chat_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id.
+def _chat_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive frame that shares the stream's id, model and creation time.
 
     The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
     (``chatcmpl-keepalive``) that differs from the real completion chunks.
@@ -2475,13 +2479,20 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
 
+    Callers pass ``request.model`` because every real chunk carries it: clients
+    that latch the stream's model and ``created`` from the first chunk would
+    otherwise report the sentinel ``"keepalive"`` model and epoch 0. The frame
+    is built when the stream is set up, so ``created`` is stamped then, just as
+    each real chunk stamps its own creation time.
+
     The delta must also carry ``"role":"assistant"`` — see the comment on
     ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
     first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
-        '"created":0,"model":"keepalive",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
         '"finish_reason":null}]}\n\n'
     )
@@ -3206,7 +3217,7 @@ async def _create_markitdown_chat_completion(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
-            keepalive = _chat_keepalive_chunk(response_id)
+            keepalive = _chat_keepalive_chunk(response_id, request.model)
         markdown_chunks = stream_messages_to_markdown_async(
             request.messages,
             global_settings=_server_state.global_settings,
@@ -3763,7 +3774,7 @@ async def create_completion(
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_completion")
             if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
-                keepalive = _completion_keepalive_chunk(response_id)
+                keepalive = _completion_keepalive_chunk(response_id, request.model)
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -4319,7 +4330,7 @@ async def create_chat_completion(
             response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
+                keepalive = _chat_keepalive_chunk(response_id, request.model)
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
