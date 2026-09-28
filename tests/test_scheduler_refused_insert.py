@@ -61,6 +61,36 @@ def _queue_cache_hit(scheduler, request_id, max_tokens):
     return request
 
 
+def _queue_chunked_prefill(scheduler, request_id, max_tokens):
+    """Track a request mid chunked prefill, one token from its last chunk."""
+    request = Request(
+        request_id=request_id,
+        prompt=[11, 12, 13, 14],
+        sampling_params=SamplingParams(max_tokens=max_tokens),
+    )
+    request.prompt_token_ids = [11, 12, 13, 14]
+    request.num_prompt_tokens = 4
+    state = _PrefillState(
+        request=request,
+        cache=[MagicMock()],
+        tokens_remaining=mx.array([[]]),
+        last_token=[14],
+        tokens_processed=3,
+        base_size=0,
+        emitted_boundaries={},
+        boundary_enabled=False,
+        block_size=0,
+        total_length=4,
+        sampler=MagicMock(),
+        sm=MagicMock(),
+        per_row_lps=[],
+    )
+    scheduler.requests[request_id] = request
+    scheduler.prefilling.append(request)
+    scheduler._prefill_states[request_id] = state
+    return state
+
+
 def _add_running(scheduler, request_id, uid):
     request = Request(
         request_id=request_id,
@@ -171,33 +201,10 @@ def test_refused_insert_fails_only_that_request(mock_model, mock_tokenizer):
 def test_refused_chunked_insert_fails_only_that_request(mock_model, mock_tokenizer):
     scheduler = _make_scheduler(mock_model, mock_tokenizer)
     live = _add_running(scheduler, "live", uid=7)
-    states = {}
-    for rid, max_tokens in (("bad", 0), ("good", 4)):
-        request = Request(
-            request_id=rid,
-            prompt=[11, 12, 13, 14],
-            sampling_params=SamplingParams(max_tokens=max_tokens),
-        )
-        request.prompt_token_ids = [11, 12, 13, 14]
-        request.num_prompt_tokens = 4
-        states[rid] = _PrefillState(
-            request=request,
-            cache=[MagicMock()],
-            tokens_remaining=mx.array([[]]),
-            last_token=[14],
-            tokens_processed=3,
-            base_size=0,
-            emitted_boundaries={},
-            boundary_enabled=False,
-            block_size=0,
-            total_length=4,
-            sampler=MagicMock(),
-            sm=MagicMock(),
-            per_row_lps=[],
-        )
-        scheduler.requests[rid] = request
-        scheduler.prefilling.append(request)
-        scheduler._prefill_states[rid] = states[rid]
+    states = {
+        rid: _queue_chunked_prefill(scheduler, rid, max_tokens)
+        for rid, max_tokens in (("bad", 0), ("good", 4))
+    }
     scheduler._prefill_gate_open = MagicMock(return_value=True)
     scheduler._step_prefill_chunk = MagicMock(return_value=True)
     scheduler._emit_final_boundary_if_needed = MagicMock()
@@ -213,6 +220,68 @@ def test_refused_chunked_insert_fails_only_that_request(mock_model, mock_tokeniz
     assert "bad" not in scheduler._prefill_states
     assert list(scheduler.prefilling) == []
     assert scheduler.running == {"live": live, "good": good}
+
+
+def test_refused_chunked_insert_leaves_other_prefills_in_flight(
+    mock_model, mock_tokenizer
+):
+    scheduler = _make_scheduler(mock_model, mock_tokenizer)
+    _queue_chunked_prefill(scheduler, "bad", 0)
+    slow = _queue_chunked_prefill(scheduler, "slow", 4)
+    scheduler._prefill_gate_open = MagicMock(return_value=True)
+    # "bad" finishes its prefill this step; "slow" still has chunks to go.
+    scheduler._step_prefill_chunk = MagicMock(
+        side_effect=lambda state: state.request.request_id == "bad"
+    )
+    scheduler._emit_final_boundary_if_needed = MagicMock()
+
+    scheduled, rejected = [], []
+    scheduler._advance_chunked_prefills(scheduled, rejected)
+
+    assert scheduled == []
+    assert [output.request_id for output in rejected] == ["bad"]
+    assert list(scheduler.prefilling) == [slow.request]
+    assert scheduler._prefill_states == {"slow": slow}
+    assert set(scheduler.requests) == {"slow"}
+
+
+def test_refused_insert_releases_its_paged_cache_blocks(mock_model, mock_tokenizer):
+    scheduler = _make_scheduler(mock_model, mock_tokenizer)
+    paged = MagicMock()
+    paged.get_block_table.return_value = MagicMock(block_ids=[5, 6, 7])
+    paged.release_for_eviction.return_value = 3
+    scheduler.paged_cache_manager = paged
+    _queue_cache_hit(scheduler, "bad", max_tokens=0)
+    scheduler._prefill_gate_open = MagicMock(return_value=True)
+
+    scheduled, rejected = scheduler._schedule_waiting()
+
+    assert scheduled == []
+    assert [output.request_id for output in rejected] == ["bad"]
+    paged.get_block_table.assert_any_call("bad")
+    paged.release_for_eviction.assert_called_once_with([5, 6, 7])
+
+
+def test_scheduler_goes_idle_after_a_lone_refusal(mock_model, mock_tokenizer):
+    scheduler = _make_scheduler(mock_model, mock_tokenizer)
+    _queue_cache_hit(scheduler, "bad", max_tokens=-1)
+
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        output = scheduler.step()
+        refusals = [o for o in output.outputs if o.request_id == "bad"]
+        assert len(refusals) == 1
+        assert not (scheduler.waiting or scheduler.prefilling or scheduler.running)
+        assert scheduler.requests == {}
+        # The abort path may defer one Metal cache clear; nothing else is left.
+        for _ in range(8):
+            if not scheduler.has_requests():
+                break
+            scheduler.step()
+        assert scheduler.has_requests() is False
+        # engine_core may still abort the refused id afterwards; that is a no-op.
+        scheduler.abort_request("bad")
+        scheduler.step()
+    assert scheduler.has_requests() is False
 
 
 def test_step_reports_refused_insert_without_raising(mock_model, mock_tokenizer):
