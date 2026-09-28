@@ -1221,6 +1221,89 @@ def test_glm5_next_decode_indexer_reads_non_row_contiguous_keys():
     _assert_matches_indexer_reference(actual, q, keys, weights)
 
 
+def test_glm5_next_decode_scan_matches_reference_in_float16():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(67)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.float16)
+    keys = (mx.random.normal((2, 4096, 128)) * 0.5).astype(mx.float16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.float16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    assert actual.dtype == mx.float16
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def _forbid_decode_scan(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_decode_scores",
+        lambda *a, **k: pytest.fail("the decode scan must not run here"),
+    )
+
+
+# The tests below replace the kernels with Python stand-ins, so they pin the
+# routing on every build, with or without the native extension or a GPU.
+
+
+@pytest.mark.parametrize("rows,pool_len", [(1, 8192), (1, 100), (2, 8192), (31, 8192)])
+def test_glm5_next_indexer_without_the_decode_scan_never_pads_short_queries(
+    rows, pool_len, monkeypatch
+):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    # Only the prefill tile is built: short queries still take the fallback.
+    monkeypatch.setattr(fast, "has_symbol", lambda name: name == "dsa_indexer_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    q = mx.zeros((1, rows, 32, 128), dtype=mx.bfloat16)
+    keys = mx.zeros((1, pool_len, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((1, rows, 32), dtype=mx.bfloat16)
+    assert indexer._native_scores(q, keys, weights) is None
+
+
+def test_glm5_next_decode_scan_receives_the_kernel_call_shapes(monkeypatch):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    seen = {}
+
+    def decode_scan(q, keys, weights):
+        seen.update(q=q.shape, keys=keys.shape, weights=weights.shape)
+        return mx.zeros((q.shape[0], 1, 1, keys.shape[2]), dtype=q.dtype)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "dsa_decode_scores", decode_scan)
+    _forbid_padded_tile(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    scores = indexer._native_scores(
+        mx.zeros((3, 1, 32, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 5000, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 1, 32), dtype=mx.bfloat16),
+    )
+    # q [B,H,1,D], keys [B,1,P,D], weights [B,H] in; scores [B,1,P] out.
+    assert seen == {"q": (3, 32, 1, 128), "keys": (3, 1, 5000, 128), "weights": (3, 32)}
+    assert scores.shape == (3, 1, 5000)
+
+
+@pytest.mark.parametrize("rows", [1, 37])
+def test_glm5_next_indexer_falls_back_when_the_pool_dtype_differs(rows, monkeypatch):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    assert (
+        indexer._native_scores(
+            mx.zeros((1, rows, 32, 128), dtype=mx.bfloat16),
+            mx.zeros((1, 5000, 128), dtype=mx.float16),
+            mx.zeros((1, rows, 32), dtype=mx.bfloat16),
+        )
+        is None
+    )
+
+
 def _feed_indexer(indexer, config, cache, tokens, seed):
     mx.random.seed(seed)
     shape = (1, tokens)
