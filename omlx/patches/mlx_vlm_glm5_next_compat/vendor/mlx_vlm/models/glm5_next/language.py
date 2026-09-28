@@ -47,6 +47,10 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+# Pooled-key count from which the fused single-query decode scan replaces
+# the MLX matmul, the same key-count gate the GLM-5.x deepseek_v32 decode
+# path applies to this kernel; below it the two measure at parity.
+_NATIVE_DECODE_MIN_POOL = 4096
 
 
 # Causal row blocks of the dense-prefix attention (1 = one call).
@@ -836,9 +840,29 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast
 
+            qt = q.transpose(0, 2, 1, 3)
+            if q.shape[1] == 1:
+                # Decode: the fused single-query scan instead of padding one
+                # query row to a 64-row prefill tile, which costs 64x the
+                # FLOPs and measures 3-5x slower than the MLX fallback.
+                if pool_keys.shape[1] < _NATIVE_DECODE_MIN_POOL or not (
+                    fast.has_symbol("dsa_decode_scores")
+                ):
+                    return None
+                # The kernel validates key strides only while the graph is
+                # built and assumes unit-stride rows at eval, so a transposed
+                # or otherwise non-row-contiguous pool would be misread.
+                # contiguous() is a no-op for a single sequence's pool slice.
+                keys = mx.contiguous(pool_keys)[:, None]
+                return fast.dsa_decode_scores(
+                    qt, keys, weights.reshape(weights.shape[0], self.n_heads)
+                )[:, 0]
+            if q.shape[1] < 32:
+                # Short multi-query chunks: the 64-row tile loses to the MLX
+                # matmul below roughly 32-48 rows on M3 Ultra.
+                return None
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
-            qt = q.transpose(0, 2, 1, 3)
             keys = pool_keys[:, None]
             q_pad = (-qt.shape[2]) % 64
             k_pad = (-keys.shape[2]) % 64

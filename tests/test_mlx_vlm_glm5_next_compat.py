@@ -717,9 +717,9 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     config.index_head_dim = 128
     indexer = Glm5NextIndexer(config)
     mx.random.seed(23)
-    q = mx.random.normal((1, 5, 32, 128), dtype=mx.float16)
+    q = mx.random.normal((1, 37, 32, 128), dtype=mx.float16)
     keys = mx.random.normal((1, 7, 128), dtype=mx.float16)
-    weights = mx.random.normal((1, 5, 32), dtype=mx.float16)
+    weights = mx.random.normal((1, 37, 32), dtype=mx.float16)
     actual = indexer._native_scores(q, keys, weights)
     if actual is None:
         pytest.skip("GLM DSA indexer kernel rejected the installed ABI")
@@ -4640,3 +4640,182 @@ def test_compile_ffn_block_keeps_module_arrays_when_the_trace_raises():
     after = [layer.ffn_hc.weight, layer.mlp.weight, layer.mlp.experts[0].weight]
     assert all(a is b for a, b in zip(before, after))
     mx.eval(layer._ffn_block(mx.ones((8,))))
+
+
+def _indexer_reference(q, pool_keys, weights):
+    f32 = mx.float32
+    scores = q.astype(f32) @ pool_keys[:, None].astype(f32).swapaxes(-1, -2)
+    return mx.sum(weights.astype(f32)[..., None] * mx.maximum(scores, 0), axis=2)
+
+
+def _assert_matches_indexer_reference(actual, q, pool_keys, weights):
+    reference = _indexer_reference(q, pool_keys, weights)
+    mx.eval(actual, reference)
+    assert actual.shape == reference.shape
+    assert mx.allclose(
+        actual.astype(mx.float32), reference, atol=0.08, rtol=0.02
+    ).item()
+
+
+def _native_decode_indexer():
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    config = _tiny_config().text_config
+    config.index_n_heads = 32
+    config.index_head_dim = 128
+    config.index_kpool = 4
+    config.index_topk = 2048
+    indexer = Glm5NextIndexer(config)
+    indexer.set_dtype(mx.bfloat16)
+    return indexer, config
+
+
+def _require_native_kernel(symbol):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if not fast.has_symbol(symbol):
+        pytest.skip(f"GLM DSA native {symbol} kernel is not built")
+    return fast
+
+
+def _count_kernel_calls(monkeypatch, fast, symbol):
+    calls = []
+    kernel = getattr(fast, symbol)
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(fast, symbol, counted)
+    return calls
+
+
+def _forbid_padded_tile(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_indexer_scores",
+        lambda *a, **k: pytest.fail("decode must not use the padded prefill tile"),
+    )
+
+
+@pytest.mark.parametrize("pool_len,native", [(4095, False), (4096, True), (8199, True)])
+def test_glm5_next_decode_indexer_uses_fused_decode_scan(pool_len, native, monkeypatch):
+    fast = _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_decode_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(29)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((2, pool_len, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+@pytest.mark.parametrize("rows,native", [(2, False), (31, False), (32, True)])
+def test_glm5_next_indexer_pads_to_the_tile_only_from_32_query_rows(
+    rows, native, monkeypatch
+):
+    fast = _require_native_kernel("dsa_indexer_scores")
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_indexer_scores")
+    mx.random.seed(61)
+    q = (mx.random.normal((1, rows, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((1, 4100, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((1, rows, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def test_glm5_next_decode_indexer_reads_non_row_contiguous_keys():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(31)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    transposed = (mx.random.normal((2, 128, 4099)) * 0.5).astype(mx.bfloat16)
+    mx.eval(transposed)
+    keys = transposed.swapaxes(1, 2)  # last-axis stride != 1
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def _feed_indexer(indexer, config, cache, tokens, seed):
+    mx.random.seed(seed)
+    shape = (1, tokens)
+    x = mx.random.normal((*shape, config.hidden_size)) * 0.5
+    qr = mx.random.normal((*shape, config.q_lora_rank)) * 0.5
+    out = indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache)
+    mx.eval(out)
+
+
+def _decode_step_matches_reference(indexer, config, cache, batch, monkeypatch):
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    seen = []
+    original = Glm5NextIndexer._native_scores
+
+    def spy(self, q, pool_keys, weights):
+        out = original(self, q, pool_keys, weights)
+        seen.append((q, pool_keys, weights, out))
+        return out
+
+    monkeypatch.setattr(Glm5NextIndexer, "_native_scores", spy)
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(37)
+    x = mx.random.normal((batch, 1, config.hidden_size)) * 0.5
+    qr = mx.random.normal((batch, 1, config.q_lora_rank)) * 0.5
+    mx.eval(indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache))
+    assert len(seen) == 1
+    q, pool_keys, weights, actual = seen[0]
+    assert q.shape[1] == 1 and pool_keys.shape[1] >= 4096
+    assert actual is not None, "decode must take the native scan at this depth"
+    _assert_matches_indexer_reference(actual, q, pool_keys, weights)
+
+
+def test_glm5_next_decode_scan_matches_reference_through_pooling_cache(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    cache = PoolingCache(4)
+    # Two prefill chunks so the pool buffer grows past its first allocation.
+    _feed_indexer(indexer, config, cache, 8192, seed=41)
+    _feed_indexer(indexer, config, cache, 8210, seed=43)
+    _decode_step_matches_reference(indexer, config, cache, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_after_state_restore(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    source = PoolingCache(4)
+    _feed_indexer(indexer, config, source, 16410, seed=47)
+    restored = PoolingCache(4)
+    restored.state = source.state
+    restored.meta_state = source.meta_state
+    _decode_step_matches_reference(indexer, config, restored, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_for_batched_unequal_pools(
+    monkeypatch,
+):
+    from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    first, second = PoolingCache(4), PoolingCache(4)
+    _feed_indexer(indexer, config, first, 16400, seed=53)
+    _feed_indexer(indexer, config, second, 17003, seed=59)
+    batch = BatchPoolingCache.merge([first, second])
+    _decode_step_matches_reference(indexer, config, batch, 2, monkeypatch)
