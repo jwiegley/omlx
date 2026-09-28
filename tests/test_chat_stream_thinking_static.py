@@ -130,3 +130,15 @@ def test_nonstream_builders_split_prompt_opened_thinking():
                 and isinstance(flags[0].func, ast.Name)
                 and flags[0].func.id == "_chat_prompt_opens_thinking"
             ), f"{name} must not gate start_in_thinking on the finish reason"
+
+
+def test_responses_stream_start_state_follows_rendered_prompt_only():
+    """The Responses stream must not start in thinking on a template flag."""
+    node = _server_stream_node("stream_responses_api")
+    assert "native_reasoning" not in {
+        arg.arg for arg in node.args.args + node.args.kwonlyargs
+    }, "stream_responses_api must not take a native_reasoning start flag"
+    assert not any(
+        isinstance(name, ast.Name) and name.id == "native_reasoning"
+        for name in ast.walk(node)
+    ), "stream_responses_api must decide its start state from the prompt alone"
