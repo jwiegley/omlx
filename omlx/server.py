@@ -7349,7 +7349,6 @@ async def create_response(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_format=response_format,
-                                native_reasoning=native_reasoning,
                                 namespace_aliases=namespace_aliases,
                                 **chat_kwargs,
                             ),
@@ -7544,7 +7543,6 @@ async def stream_responses_api(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_format=None,
-    native_reasoning: bool = False,
     namespace_aliases: Optional[dict] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
@@ -7559,7 +7557,10 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning or _chat_prompt_opens_thinking(
+    # Follow the rendered prompt, as the scheduler does: a preserve-thinking
+    # template rendered with enable_thinking=false closes the block, and the
+    # reply is the answer.
+    start_in_thinking = _chat_prompt_opens_thinking(
         engine, messages, kwargs, surface="Responses stream"
     )
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
