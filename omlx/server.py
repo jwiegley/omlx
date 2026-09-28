@@ -5248,9 +5248,8 @@ async def create_chat_completion(
             thinking_content, regular_content = extract_thinking(
                 raw_text,
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -7860,9 +7859,8 @@ async def create_anthropic_message(
             thinking_content, regular_content = extract_thinking(
                 raw_text,
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -8640,9 +8638,8 @@ async def create_response(
             thinking_content, regular_content = extract_thinking(
                 raw_text,
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
 
