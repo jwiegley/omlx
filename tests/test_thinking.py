@@ -452,3 +452,44 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+
+@pytest.mark.parametrize(
+    "text, truncated, expected",
+    [
+        # Prompt-opened block cut off by max_tokens stays reasoning.
+        ("unfinished", True, ("unfinished", "")),
+        ("first</think>answer<think>second", True, ("first\nsecond", "answer")),
+        ("done</think>answer", False, ("done", "answer")),
+        (
+            "first</think>answer<think>second</think>more",
+            False,
+            ("first\nsecond", "answermore"),
+        ),
+        # An unclosed block that ended normally is still recovered as the
+        # answer, as ThinkingParser.finish() does for streams.
+        ("never closed", False, ("", "never closed")),
+        # An opener already present is kept, not doubled.
+        ("<think>echoed</think>answer", False, ("echoed", "answer")),
+        ("\n<think>echoed</think>answer", False, ("echoed", "answer")),
+        ("<mm:think>echoed</mm:think>answer", False, ("echoed", "answer")),
+    ],
+)
+def test_extract_prompt_opened_thinking(text, truncated, expected):
+    assert (
+        extract_thinking(text, truncated=truncated, starts_in_thinking=True) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "text, truncated",
+    [("unfinished", True), ("done</think>answer", False)],
+)
+def test_prompt_opened_complete_text_matches_stream(text, truncated):
+    parser = ThinkingParser(start_in_thinking=True)
+    parts = [parser.feed(text), parser.finish(truncated=truncated)]
+    streamed = ("".join(p[0] for p in parts), "".join(p[1] for p in parts))
+    assert (
+        extract_thinking(text, truncated=truncated, starts_in_thinking=True) == streamed
+    )

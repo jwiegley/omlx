@@ -4363,6 +4363,11 @@ async def create_chat_completion(
         # Non-streaming response with keepalive during prefill
         async def _build_chat_completion():
             await _raise_if_llm_lease_abort_requested(lease)
+            # Decoded engine text omits the scheduler's synthetic think
+            # opener, so detect a prompt-opened block as the stream does.
+            starts_in_thinking = _chat_prompt_opens_thinking(
+                engine, messages, chat_kwargs, surface="chat completion"
+            )
             start_time = time.perf_counter()
 
             output = await engine.chat(messages=messages, **chat_kwargs)
@@ -4409,7 +4414,9 @@ async def create_chat_completion(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                starts_in_thinking=starts_in_thinking,
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -5165,6 +5172,35 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _chat_prompt_opens_thinking(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+    *,
+    surface: str,
+) -> bool:
+    """Return whether the rendered chat prompt leaves a thinking block open.
+
+    Streaming and non-streaming handlers share this so both classify the
+    reasoning body the same way when the chat template (GLM-5.3, Qwen3.x
+    with thinking enabled) ends the generation prompt with ``<think>``.
+    """
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is None:
+            return False
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, kwargs
+        )
+        opens, _ = prompt_opens_thinking(
+            tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+    except Exception as exc:
+        logger.debug("Could not detect %s thinking state: %s", surface, exc)
+        return False
+    return opens
+
+
 class _ToolCallGenerationError(HTTPException):
     """Keep generation failure codes through JSON keepalive responses."""
 
@@ -5299,18 +5335,9 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    start_in_thinking = False
-    try:
-        tokenizer = getattr(engine, "tokenizer", None)
-        if tokenizer is not None:
-            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                engine, messages, kwargs
-            )
-            start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
-            )
-    except Exception as exc:
-        logger.debug("Could not detect chat stream thinking state: %s", exc)
+    start_in_thinking = _chat_prompt_opens_thinking(
+        engine, messages, kwargs, surface="chat stream"
+    )
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
 
     def mark_visible_delta() -> None:
@@ -5980,18 +6007,9 @@ async def stream_anthropic_messages(
     # Track content blocks with thinking separation. Some templates open the
     # thinking block in the prompt itself, so the generated text starts with
     # reasoning body and only later emits </think>.
-    start_in_thinking = False
-    try:
-        tokenizer = getattr(engine, "tokenizer", None)
-        if tokenizer is not None:
-            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                engine, messages, kwargs
-            )
-            start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
-            )
-    except Exception as exc:
-        logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
+    start_in_thinking = _chat_prompt_opens_thinking(
+        engine, messages, kwargs, surface="Anthropic stream"
+    )
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     thinking_block_started = False
     text_block_started = False
@@ -6709,6 +6727,11 @@ async def create_anthropic_message(
         # Non-streaming response with keepalive during prefill
         async def _build_anthropic_message():
             await _raise_if_llm_lease_abort_requested(lease)
+            # Decoded engine text omits the scheduler's synthetic think
+            # opener, so detect a prompt-opened block as the stream does.
+            starts_in_thinking = _chat_prompt_opens_thinking(
+                engine, messages, chat_kwargs, surface="Anthropic message"
+            )
             start_time = time.perf_counter()
 
             output = await engine.chat(messages=messages, **chat_kwargs)
@@ -6741,7 +6764,9 @@ async def create_anthropic_message(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                starts_in_thinking=starts_in_thinking,
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -7265,6 +7290,11 @@ async def create_response(
         # Non-streaming with keepalive during prefill
         async def _build_responses_api():
             await _raise_if_llm_lease_abort_requested(lease)
+            # Decoded engine text omits the scheduler's synthetic think
+            # opener, so detect a prompt-opened block as the stream does.
+            starts_in_thinking = _chat_prompt_opens_thinking(
+                engine, messages, chat_kwargs, surface="Responses API"
+            )
             start_time = time.perf_counter()
             output = await engine.chat(messages=messages, **chat_kwargs)
 
@@ -7296,7 +7326,9 @@ async def create_response(
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                starts_in_thinking=starts_in_thinking,
             )
 
             # Parse tool calls
@@ -7448,19 +7480,9 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    start_in_thinking = native_reasoning or _chat_prompt_opens_thinking(
+        engine, messages, kwargs, surface="Responses stream"
+    )
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     seq = 0
 

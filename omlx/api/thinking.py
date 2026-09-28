@@ -142,7 +142,9 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
+def extract_thinking(
+    text: str, *, truncated: bool = False, starts_in_thinking: bool = False
+) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -159,6 +161,14 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
 
     With ``truncated=True``, unfinished thinking stays in the thinking channel.
 
+    With ``starts_in_thinking=True`` the prompt already opened the thinking
+    block, so text before the first tag is thinking, exactly as
+    ``ThinkingParser(start_in_thinking=True)`` treats a stream. Decoded
+    engine text normally carries no opener in that case, because the
+    scheduler prepends its synthetic ``<think>`` to the first streamed chunk
+    rather than to the completion text; an opener that is present is kept
+    and not duplicated.
+
     Tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
     fallback): when the model emits no thinking markers, surface the body
@@ -167,6 +177,7 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     Args:
         text: Complete model output text.
         truncated: Keep unfinished thinking in its channel on length termination.
+        starts_in_thinking: The prompt opened a thinking block the text continues.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -180,6 +191,8 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
         .replace(_HY3_OPEN_TAG, _OPEN_TAG)
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
+    if starts_in_thinking and not text.lstrip().startswith(_OPEN_TAG):
+        text = _OPEN_TAG + text
 
     thinking_parts = []
     remaining = text
