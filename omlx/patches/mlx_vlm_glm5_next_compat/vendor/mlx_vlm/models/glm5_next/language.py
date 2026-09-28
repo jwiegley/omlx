@@ -849,10 +849,17 @@ class Glm5NextIndexer(nn.Module):
                     fast.has_symbol("dsa_decode_scores")
                 ):
                     return None
-                # The kernel validates key strides only while the graph is
-                # built and assumes unit-stride rows at eval, so a transposed
-                # or otherwise non-row-contiguous pool would be misread.
-                # contiguous() is a no-op for a single sequence's pool slice.
+                # At eval the kernel reads the keys' batch and row strides but
+                # assumes a unit-stride last axis, and its graph-time layout
+                # check sees only a lazy array's default strides, so a
+                # transposed pool would be misread. contiguous() rules that
+                # out. It is a no-op for one sequence's capacity-backed pool
+                # slice. With several sequences, BatchPoolingCache.pooled is
+                # a strided view of a larger buffer, so it copies the whole
+                # pool, B * P * 256 bytes per DSA layer per step: about
+                # 17 MB at B=2 and 131K context, an estimated 0.4-0.9 ms per
+                # step over the 11 layers (not measured). No production
+                # pool is transposed; the copy only guards future layouts.
                 keys = mx.contiguous(pool_keys)[:, None]
                 return fast.dsa_decode_scores(
                     qt, keys, weights.reshape(weights.shape[0], self.n_heads)
