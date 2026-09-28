@@ -24,7 +24,7 @@ def test_stream_chat_completion_starts_parser_when_prompt_opens_thinking():
         for call in ast.walk(node)
         if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
     }
-    assert "prompt_opens_thinking" in called, (
+    assert "_chat_prompt_opens_thinking" in called, (
         "stream_chat_completion must detect when the rendered chat prompt "
         "already opens the thinking block; otherwise initial reasoning deltas "
         "are emitted as public content."
@@ -58,7 +58,7 @@ def test_stream_responses_api_starts_parser_when_prompt_opens_thinking():
         for call in ast.walk(node)
         if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
     }
-    assert "prompt_opens_thinking" in called, (
+    assert "_chat_prompt_opens_thinking" in called, (
         "stream_responses_api must detect when the rendered chat prompt "
         "already opens the thinking block; otherwise initial reasoning deltas "
         "are emitted as output_text instead of a reasoning item."
@@ -82,3 +82,52 @@ def test_stream_responses_api_starts_parser_when_prompt_opens_thinking():
         "ThinkingParser so prompt-opened reasoning streams as "
         "reasoning summary deltas, not output_text."
     )
+
+
+def _called_names(node) -> set[str]:
+    return {
+        call.func.id
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+
+
+def test_chat_prompt_detector_uses_scheduler_prompt_ids():
+    """The shared detector must mirror the scheduler's token-level decision."""
+    node = _server_stream_node("_chat_prompt_opens_thinking")
+    assert "_render_chat_prompt_for_thinking_detection" in _called_names(node)
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "prompt_opens_thinking"
+        and any(keyword.arg == "prompt_token_ids" for keyword in call.keywords)
+        for call in ast.walk(node)
+    ), "_chat_prompt_opens_thinking must pass the rendered prompt ids through."
+
+
+def test_nonstream_builders_split_prompt_opened_thinking():
+    """Complete replies must classify prompt-opened reasoning like streams.
+
+    Decoded engine text never carries the scheduler's synthetic opener, so a
+    builder that skips detection reports a length-terminated reasoning body
+    as the answer.
+    """
+    for name in (
+        "_build_chat_completion",
+        "_build_anthropic_message",
+        "_build_responses_api",
+    ):
+        node = _server_stream_node(name)
+        assert "_chat_prompt_opens_thinking" in _called_names(node), name
+        split_calls = [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "extract_thinking"
+        ]
+        assert split_calls, name
+        assert all(
+            any(keyword.arg == "starts_in_thinking" for keyword in call.keywords)
+            for call in split_calls
+        ), f"{name} must pass starts_in_thinking into extract_thinking"

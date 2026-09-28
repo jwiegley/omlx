@@ -2465,6 +2465,42 @@ class TestJsonOutputParsing:
         assert "Hello" in output_text
 
 
+def _nonstream_channels(api: str, data: dict[str, Any]) -> tuple[str, str]:
+    """Return (content, reasoning) from a non-streaming response body."""
+    if api == "chat/completions":
+        message = data["choices"][0]["message"]
+        return message.get("content") or "", message.get("reasoning_content") or ""
+    if api == "messages":
+        content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
+        reasoning = "".join(
+            b["thinking"] for b in data["content"] if b["type"] == "thinking"
+        )
+        return content, reasoning
+    content = "".join(
+        b["text"]
+        for item in data["output"]
+        if item["type"] == "message"
+        for b in item["content"]
+        if b["type"] == "output_text"
+    )
+    reasoning = "".join(
+        b["text"]
+        for item in data["output"]
+        if item["type"] == "reasoning"
+        for b in item["summary"]
+    )
+    return content, reasoning
+
+
+def _nonstream_body(api: str) -> dict[str, Any]:
+    body: dict[str, Any] = {"model": "test-model", "max_tokens": 64}
+    if api == "responses":
+        body["input"] = "Reply OK"
+    else:
+        body["messages"] = [{"role": "user", "content": "Reply OK"}]
+    return body
+
+
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
 def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
     mock_llm_engine.chat = AsyncMock(
@@ -2472,38 +2508,78 @@ def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
             text="<think>unfinished", finish_reason="length"
         )
     )
-    body = {"model": "test-model", "max_tokens": 64}
-    if api == "responses":
-        body["input"] = "Reply OK"
-    else:
-        body["messages"] = [{"role": "user", "content": "Reply OK"}]
-    response = client.post(f"/v1/{api}", json=body)
+    response = client.post(f"/v1/{api}", json=_nonstream_body(api))
     assert response.status_code == 200, response.text
     data = response.json()
     if api == "chat/completions":
-        message = data["choices"][0]["message"]
-        content = message.get("content") or ""
-        reasoning = message.get("reasoning_content") or ""
         assert data["choices"][0]["finish_reason"] == "length"
     elif api == "messages":
-        content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
-        reasoning = "".join(
-            b["thinking"] for b in data["content"] if b["type"] == "thinking"
-        )
         assert data["stop_reason"] == "max_tokens"
-    else:
-        content = "".join(
-            b["text"]
-            for item in data["output"]
-            if item["type"] == "message"
-            for b in item["content"]
-            if b["type"] == "output_text"
-        )
-        reasoning = "".join(
-            b["text"]
-            for item in data["output"]
-            if item["type"] == "reasoning"
-            for b in item["summary"]
-        )
+    content, reasoning = _nonstream_channels(api, data)
     assert content == ""
     assert reasoning == "unfinished"
+
+
+class _PromptOpensThinkingTokenizer(MockTokenizer):
+    """Chat template that ends the generation prompt with ``<think>``.
+
+    GLM-5.3 always does this and Qwen3.x does it with thinking enabled. The
+    decoded completion text then starts inside the reasoning body, because
+    the scheduler adds its synthetic opener only to the first streamed chunk.
+    """
+
+    think_start = "<think>"
+    think_end = "</think>"
+    think_start_id = 999
+    think_end_id = 998
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {
+            self.think_start: self.think_start_id,
+            self.think_end: self.think_end_id,
+        }.get(token, self.unk_token_id)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        ids = super().encode(text)
+        if text.rstrip().endswith(self.think_start):
+            ids.append(self.think_start_id)
+        return ids
+
+    def apply_chat_template(
+        self, messages: list[dict], tokenize: bool = False, **kwargs
+    ) -> str:
+        return super().apply_chat_template(messages) + "\nassistant:<think>"
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+@pytest.mark.parametrize(
+    "prompt_opens, text, finish_reason, expected",
+    [
+        # The regression: a length-terminated reply that never reached
+        # </think> must stay reasoning, matching the streaming path.
+        (True, "unfinished", "length", ("", "unfinished")),
+        (
+            True,
+            "first</think>answer<think>second",
+            "length",
+            ("answer", "first\nsecond"),
+        ),
+        (True, "done</think>answer", "stop", ("answer", "done")),
+        # An opener the engine already emitted is not doubled.
+        (True, "<think>echoed</think>answer", "stop", ("answer", "echoed")),
+        # A template that leaves no block open keeps tag-free text as content.
+        (False, "unfinished", "length", ("unfinished", "")),
+    ],
+)
+def test_nonstream_prompt_opened_thinking_channels(
+    client, mock_llm_engine, api, prompt_opens, text, finish_reason, expected
+):
+    if prompt_opens:
+        mock_llm_engine._tokenizer = _PromptOpensThinkingTokenizer()
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(text=text, finish_reason=finish_reason)
+    )
+    response = client.post(f"/v1/{api}", json=_nonstream_body(api))
+    assert response.status_code == 200, response.text
+    assert _nonstream_channels(api, response.json()) == expected
