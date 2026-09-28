@@ -2139,6 +2139,19 @@ def validate_context_window(
         )
 
 
+def validate_output_token_limit(value: int | None, field: str) -> None:
+    """Reject a non-positive output token cap with a 400 before any engine work.
+
+    mlx-lm's BatchGenerator.insert refuses max_tokens <= 0, and it runs
+    only after the request's full prefill, inside the engine loop shared
+    by every request on the model.
+    """
+    if value is not None and value < 1:
+        raise InvalidRequestError(
+            f"{field} must be at least 1, got {value}", field=field
+        )
+
+
 def init_server(
     model_dirs: str | list[str],
     scheduler_config=None,
@@ -3790,6 +3803,7 @@ async def create_completion(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
+    validate_output_token_limit(request.max_tokens, "max_tokens")
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4042,6 +4056,9 @@ async def create_chat_completion(
             logger.log(
                 5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview
             )
+
+    # max_completion_tokens arrives here as max_tokens (validation alias).
+    validate_output_token_limit(request.max_tokens, "max_tokens")
 
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
@@ -6516,6 +6533,7 @@ async def create_anthropic_message(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
     )
+    validate_output_token_limit(request.max_tokens, "max_tokens")
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -7036,6 +7054,7 @@ async def create_response(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    validate_output_token_limit(request.max_output_tokens, "max_output_tokens")
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,

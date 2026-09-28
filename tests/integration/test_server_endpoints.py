@@ -2347,6 +2347,52 @@ class TestErrorHandling:
         assert response.status_code == 422
 
 
+_CHAT_BODY = {"messages": [{"role": "user", "content": "Hello"}]}
+# (endpoint, body without the cap, request field carrying the cap, error param)
+_OUTPUT_TOKEN_CAPS = [
+    ("/v1/chat/completions", _CHAT_BODY, "max_tokens", "max_tokens"),
+    ("/v1/chat/completions", _CHAT_BODY, "max_completion_tokens", "max_tokens"),
+    ("/v1/completions", {"prompt": "Hello"}, "max_tokens", "max_tokens"),
+    ("/v1/messages", _CHAT_BODY, "max_tokens", "max_tokens"),
+    ("/v1/responses", {"input": "Hello"}, "max_output_tokens", "max_output_tokens"),
+]
+
+
+class TestOutputTokenLimitValidation:
+    """A non-positive output token cap is a 400 that never reaches an engine.
+
+    mlx-lm's BatchGenerator.insert refuses max_tokens <= 0 only after the
+    full prefill, inside the engine loop every request on the model shares.
+    """
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("value", [0, -5])
+    @pytest.mark.parametrize("endpoint,body,field,param", _OUTPUT_TOKEN_CAPS)
+    def test_non_positive_cap_is_rejected_before_engine_work(
+        self, client, mock_engine_pool, endpoint, body, field, param, value, stream
+    ):
+        response = client.post(
+            endpoint,
+            json={"model": "test-model", **body, field: value, "stream": stream},
+        )
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["param"] == param
+        assert error["message"] == f"{param} must be at least 1, got {value}"
+        assert mock_engine_pool.get_engine_calls == []
+
+    @pytest.mark.parametrize("endpoint,body,field,param", _OUTPUT_TOKEN_CAPS)
+    def test_one_token_cap_is_accepted(
+        self, client, mock_engine_pool, endpoint, body, field, param
+    ):
+        response = client.post(endpoint, json={"model": "test-model", **body, field: 1})
+
+        assert response.status_code == 200
+        assert mock_engine_pool.get_engine_calls
+
+
 class TestJsonOutputParsing:
     """Tests for parse_json_output in non-streaming endpoints."""
 
