@@ -13,7 +13,16 @@ These models define the request and response schemas for:
 import json
 from typing import Annotated, Any, Dict, List, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    PrivateAttr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -330,6 +339,12 @@ def _check_ngram_window(size: int | None, window: int | None) -> None:
         raise ValueError("ngram_window must be 0 or at least no_repeat_ngram_size")
 
 
+# Both names fill ChatCompletionRequest.max_tokens; when a request sends
+# both, max_tokens wins (AliasChoices tries them in this order).
+_OUTPUT_TOKEN_CAP_NAMES = ("max_tokens", "max_completion_tokens")
+_INT = TypeAdapter(int)
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -344,7 +359,7 @@ class ChatCompletionRequest(BaseModel):
     ngram_window: int | None = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
-        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+        validation_alias=AliasChoices(*_OUTPUT_TOKEN_CAP_NAMES),
     )
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -384,6 +399,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Each output token cap the client sent, under the name it used.
+    _output_token_caps: dict[str, int] = PrivateAttr(default_factory=dict)
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -392,6 +409,32 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def record_output_token_caps(cls, data, handler):
+        """Keep max_tokens and max_completion_tokens apart for validation.
+
+        The alias folds both into max_tokens and keeps only the first one
+        sent, so a range error could name the wrong field, and a second,
+        disagreeing value would be dropped unchecked.
+        """
+        request = handler(data)
+        if isinstance(data, dict):
+            caps = {}
+            for name in _OUTPUT_TOKEN_CAP_NAMES:
+                if data.get(name) is None:
+                    continue
+                try:
+                    caps[name] = _INT.validate_python(data[name])
+                except ValidationError as error:
+                    raise ValueError(f"{name}: {error.errors()[0]['msg']}") from None
+            request._output_token_caps = caps
+        return request
+
+    def output_token_caps(self) -> dict[str, int]:
+        """Each output token cap the client sent, keyed by the name it used."""
+        return dict(self._output_token_caps)
 
     @model_validator(mode="after")
     def check_ngram_window(self) -> "ChatCompletionRequest":
