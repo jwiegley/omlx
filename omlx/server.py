@@ -1703,6 +1703,19 @@ async def acquire_reranker_engine(model: str):
             await get_engine_pool().release_engine(leased[0])
 
 
+def _resolve_max_tokens(
+    req_max_tokens: int | None, model_settings, ocr_defaults: dict | None
+) -> int:
+    """Output token cap: request > model settings > OCR defaults > global."""
+    if req_max_tokens is not None:
+        return req_max_tokens
+    if model_settings and model_settings.max_tokens is not None:
+        return model_settings.max_tokens
+    if ocr_defaults and "max_tokens" in ocr_defaults:
+        return ocr_defaults["max_tokens"]
+    return _server_state.sampling.max_tokens
+
+
 def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
@@ -1833,14 +1846,7 @@ def get_sampling_params(
 
     # Max tokens is an output length cap, not a sampling knob. Honor request
     # bounds even when force_sampling pins token-selection parameters.
-    if req_max_tokens is not None:
-        max_tokens = req_max_tokens
-    elif model_settings and model_settings.max_tokens is not None:
-        max_tokens = model_settings.max_tokens
-    elif ocr_defaults and "max_tokens" in ocr_defaults:
-        max_tokens = ocr_defaults["max_tokens"]
-    else:
-        max_tokens = global_sampling.max_tokens
+    max_tokens = _resolve_max_tokens(req_max_tokens, model_settings, ocr_defaults)
 
     # XTC probability: request > default (0.0 = disabled)
     xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
@@ -2139,16 +2145,35 @@ def validate_context_window(
         )
 
 
-def validate_output_token_limit(value: int | None, field: str) -> None:
-    """Reject a non-positive output token cap with a 400 before any engine work.
+def validate_output_token_limit(
+    value: int | None, field: str, model_id: str | None = None
+) -> None:
+    """Reject an output token cap below 1 with a 400 before any engine work.
 
     mlx-lm's BatchGenerator.insert refuses max_tokens <= 0, and it runs
     only after the request's full prefill, inside the engine loop shared
-    by every request on the model.
+    by every request on the model. value is the cap the client sent as
+    field. When it sent none, the default get_sampling_params() will use
+    for model_id is checked instead (model settings, OCR defaults, then
+    the global default), so a misconfigured default is refused here too,
+    before a stream has answered 200.
     """
-    if value is not None and value < 1:
+    if value is not None:
+        if value < 1:
+            raise InvalidRequestError(
+                f"{field} must be at least 1, got {value}", field=field
+            )
+        return
+    default = _resolve_max_tokens(
+        None,
+        get_model_settings_for_request(model_id),
+        _get_ocr_defaults(resolve_model_id(model_id)),
+    )
+    if default < 1:
         raise InvalidRequestError(
-            f"{field} must be at least 1, got {value}", field=field
+            f"{field} was not sent and the server's default output token cap "
+            f"for this model is {default}; send {field} of at least 1",
+            field=field,
         )
 
 
@@ -3803,7 +3828,7 @@ async def create_completion(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
-    validate_output_token_limit(request.max_tokens, "max_tokens")
+    validate_output_token_limit(request.max_tokens, "max_tokens", request.model)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4057,11 +4082,16 @@ async def create_chat_completion(
                 5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview
             )
 
-    # max_completion_tokens arrives here as max_tokens (validation alias).
-    validate_output_token_limit(request.max_tokens, "max_tokens")
+    # Check each cap under the name the client sent it as; max_tokens and
+    # max_completion_tokens are aliases, so the second one is otherwise lost.
+    for name, value in request.output_token_caps().items():
+        validate_output_token_limit(value, name)
 
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
+
+    # Engine-bound from here: a missing cap falls back to the model default.
+    validate_output_token_limit(request.max_tokens, "max_tokens", request.model)
 
     request = await _preprocess_markitdown_files_for_llm(request)
 
@@ -6533,7 +6563,7 @@ async def create_anthropic_message(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
     )
-    validate_output_token_limit(request.max_tokens, "max_tokens")
+    validate_output_token_limit(request.max_tokens, "max_tokens", request.model)
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -7054,7 +7084,9 @@ async def create_response(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
-    validate_output_token_limit(request.max_output_tokens, "max_output_tokens")
+    validate_output_token_limit(
+        request.max_output_tokens, "max_output_tokens", request.model
+    )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
