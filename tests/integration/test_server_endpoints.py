@@ -2583,3 +2583,147 @@ def test_nonstream_prompt_opened_thinking_channels(
     response = client.post(f"/v1/{api}", json=_nonstream_body(api))
     assert response.status_code == 200, response.text
     assert _nonstream_channels(api, response.json()) == expected
+
+
+class _PreserveThinkingTokenizer(_PromptOpensThinkingTokenizer):
+    """Qwen3.6+ style template: opens ``<think>`` unless thinking is off.
+
+    Templates like this advertise ``preserve_thinking``, so the pool entry
+    carries ``preserve_thinking_default=True``. With ``enable_thinking``
+    false the generation prompt closes the block, the scheduler adds no
+    opener, and the model writes its answer directly.
+    """
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        ids = MockTokenizer.encode(self, text)
+        if text.rstrip().endswith(self.think_end):
+            ids += [self.think_start_id, self.think_end_id]
+        elif text.rstrip().endswith(self.think_start):
+            ids.append(self.think_start_id)
+        return ids
+
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        tokenize: bool = False,
+        enable_thinking: Optional[bool] = None,
+        **kwargs,
+    ) -> str:
+        prompt = MockTokenizer.apply_chat_template(self, messages) + "\nassistant:"
+        if enable_thinking is False:
+            return prompt + "<think>\n\n</think>\n\n"
+        return prompt + "<think>\n"
+
+
+def _responses_stream_channels(text: str) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Return streamed (content, reasoning) deltas and the final output split.
+
+    Whitespace is stripped: the scheduler's synthetic opener ends in a newline.
+    """
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = tuple(
+        "".join(e.get("delta", "") for e in events if e.get("type") == kind).strip()
+        for kind in (
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+        )
+    )
+    final = next(
+        e["response"]
+        for e in events
+        if e.get("type") in ("response.completed", "response.incomplete")
+    )
+    return deltas, tuple(
+        part.strip() for part in _nonstream_channels("responses", final)
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["complete", "stream"])
+@pytest.mark.parametrize(
+    "enable_thinking, finish_reason, expected",
+    [
+        # Thinking off closes the block in the prompt, so the reply is the
+        # answer even though the template preserves thinking by default.
+        (False, "stop", ("Paris.", "")),
+        (False, "length", ("Paris.", "")),
+        # Control: thinking on opens the block, so a reply cut off before
+        # </think> stays reasoning.
+        (None, "length", ("", "Paris.")),
+    ],
+)
+def test_responses_preserve_thinking_model_follows_rendered_prompt(
+    client,
+    mock_engine_pool,
+    mock_llm_engine,
+    stream,
+    enable_thinking,
+    finish_reason,
+    expected,
+):
+    """Responses stream and complete reply split by the rendered prompt.
+
+    A preserve-thinking template is not evidence that the prompt opened a
+    thinking block; the scheduler decides from the rendered prompt tail, and
+    both Responses paths must follow the same detector.
+    """
+    from omlx.engine_pool import EngineEntry
+
+    mock_engine_pool._entries["test-model"] = EngineEntry(
+        model_id="test-model",
+        model_path="/models/test-model",
+        model_type="llm",
+        engine_type="batched",
+        estimated_size=1,
+        preserve_thinking_default=True,
+    )
+    mock_llm_engine._tokenizer = _PreserveThinkingTokenizer()
+
+    def output(kwargs, *, streamed):
+        ct_kwargs = kwargs.get("chat_template_kwargs") or {}
+        text = "Paris."
+        # The scheduler's synthetic opener rides on the first streamed chunk
+        # only when the rendered prompt leaves the block open.
+        new_text = (
+            "<think>\n" + text
+            if streamed and ct_kwargs.get("enable_thinking") is not False
+            else text
+        )
+        return MockGenerationOutput(
+            text=text,
+            new_text=new_text,
+            prompt_tokens=3,
+            completion_tokens=2,
+            finish_reason=finish_reason,
+            finished=True,
+        )
+
+    async def chat(messages, **kwargs):
+        return output(kwargs, streamed=False)
+
+    async def stream_chat(messages, **kwargs):
+        yield output(kwargs, streamed=True)
+
+    mock_llm_engine.chat = chat
+    mock_llm_engine.stream_chat = stream_chat
+
+    body: dict[str, Any] = {
+        "model": "test-model",
+        "input": "Reply with exactly: Paris.",
+        "max_output_tokens": 2,
+        "store": False,
+        "stream": stream,
+    }
+    if enable_thinking is not None:
+        body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    response = client.post("/v1/responses", json=body)
+    assert response.status_code == 200, response.text
+    if stream:
+        deltas, final = _responses_stream_channels(response.text)
+        assert deltas == expected
+        assert final == expected
+    else:
+        assert _nonstream_channels("responses", response.json()) == expected

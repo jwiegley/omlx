@@ -131,3 +131,34 @@ def test_nonstream_builders_split_prompt_opened_thinking():
             any(keyword.arg == "starts_in_thinking" for keyword in call.keywords)
             for call in split_calls
         ), f"{name} must pass starts_in_thinking into extract_thinking"
+
+
+def test_responses_stream_start_state_follows_rendered_prompt_only():
+    """The Responses stream must not start in thinking on a template flag.
+
+    ``preserve_thinking_default`` marks a template that can keep reasoning,
+    not a prompt that opened a block. With ``enable_thinking`` false the
+    prompt closes the block and the scheduler adds no opener, so a stream
+    that started in thinking anyway would report the answer as reasoning,
+    unlike the complete reply and the other two streams.
+    """
+    node = _server_stream_node("stream_responses_api")
+    assert "native_reasoning" not in {
+        arg.arg for arg in node.args.args + node.args.kwonlyargs
+    }, "stream_responses_api must not take a native_reasoning start flag"
+    starts = [
+        stmt.value
+        for stmt in ast.walk(node)
+        if isinstance(stmt, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "start_in_thinking"
+            for target in stmt.targets
+        )
+    ]
+    assert len(starts) == 1, "stream_responses_api must set start_in_thinking once"
+    start = starts[0]
+    assert (
+        isinstance(start, ast.Call)
+        and isinstance(start.func, ast.Name)
+        and start.func.id == "_chat_prompt_opens_thinking"
+    ), "start_in_thinking must come solely from _chat_prompt_opens_thinking"
