@@ -4840,10 +4840,16 @@ def _feed_indexer(indexer, config, cache, tokens, seed):
 
 
 def _decode_step_matches_reference(indexer, config, cache, batch, monkeypatch):
+    from mlx_vlm.models.glm5_next import language
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
     from omlx.custom_kernels.glm_moe_dsa import fast
 
+    # On an M5 (NAX) GPU a one-sequence decode step takes the fused decode
+    # selection or the NAX indexer instead of _native_scores. Pin the route
+    # every other GPU takes, so these tests check the scan there too.
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
     seen = []
     original = Glm5NextIndexer._native_scores
 
