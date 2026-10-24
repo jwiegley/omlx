@@ -2118,6 +2118,41 @@ def test_percore_recurrence_falls_back_to_blocked(monkeypatch):
         assert mx.array_equal(y, y_b).item() and mx.array_equal(s, s_b).item()
 
 
+def test_percore_uncovered_geometry_matches_blocked_and_fp32_reference(monkeypatch):
+    """Force a real-host fallback without dropping rows or loosening tolerances."""
+    from omlx.patches import glm53_kda_recurrence as recurrence
+
+    cores = recurrence.gpu_core_count()
+    # Retain the H=64 regression shape where uncovered; exceed larger GPUs too.
+    heads = max(64, (cores or 0) * recurrence._PC_MAX_ROWS // 128 + 1)
+    cfg = recurrence.PerCoreConfig()
+    assert recurrence._percore_threadgroups(heads * 128, cfg) is None
+    q, k, v, a, beta, a_log, dt_bias, state = _kda_inputs(1, 30, heads, 41)
+    args = (q, k, v, a, beta, a_log, dt_bias, -5.0, state)
+    blocked = recurrence._blocked
+    launched = []
+
+    def observed_blocked(*values):
+        launched.append(True)
+        return blocked(*values)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(recurrence, "_blocked", observed_blocked)
+        y, s = recurrence.kda_recurrence(*args, config=cfg)
+    assert launched == [True]
+    y_b, s_b = blocked(*args, recurrence.DEFAULT_CONFIG)
+    y_ker, s_ker = _kda_stock(q, k, v, a, beta, a_log, dt_bias, state)
+    y_ref, s_ref = _kda_stock(q, k, v, a, beta, a_log, dt_bias, state, ops=True)
+    mx.eval(y, s, y_b, s_b, y_ker, s_ker, y_ref, s_ref)
+    assert y.dtype == mx.bfloat16 and s.dtype == mx.float32
+    assert mx.array_equal(y, y_b).item()
+    assert mx.array_equal(s, s_b).item()
+    assert mx.allclose(s, s_ker, rtol=1e-5, atol=1e-6).item()
+    assert mx.allclose(s, s_ref, rtol=1e-4, atol=1e-5).item()
+    assert mx.allclose(y, y_ker, rtol=1e-2, atol=1e-3).item()
+    assert mx.allclose(y, y_ref, rtol=1e-2, atol=1e-3).item()
+
+
 def _kda_attention(num_heads=4, hidden=256, seed=0, bits=None):
     from mlx_vlm.models import glm5_next
     from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
